@@ -1,0 +1,24 @@
+# ARC-AGI-2.
+task:
+  name: arc
+  num_aug: 1000
+  num_test_aug: 1000
+  sources:
+    - {path: data/raw/ARC-AGI-2/data/training, role: train}
+    - {path: data/raw/ARC-AGI-2/data/evaluation, role: test}
+model: {mixer: attention, L_cycles: 4}
+train:
+  total_steps: 200000
+  batch_size: 768
+  k: 16
+  time_sampler: random_start
+  pseudotargets: true
+  pseudotarget_ramp_steps: 20000
+  lr: 1.0e-4
+  warmup_steps: 2000
+  lr_schedule: constant
+  weight_decay: 0.1
+  puzzle_emb_lr: 1.0e-4
+  puzzle_emb_weight_decay: 1.0
+sample: {n_steps: 32, gamma: 1.0}
+eval: {every: 20000, batch_size: 256, save_dir: runs/arc2}

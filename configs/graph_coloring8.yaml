@@ -1,0 +1,14 @@
+task: {name: graph_coloring, n: 8, edge_prob: 0.35, num_train: 20000, num_test: 1000}
+model: {mixer: attention, L_cycles: 4}
+train:
+  total_steps: 50000
+  batch_size: 768
+  k: 16
+  sigma: 1.0
+  time_sampler: sorted
+  lr: 1.0e-4
+  warmup_steps: 2000
+  lr_schedule: constant
+  weight_decay: 1.0
+sample: {n_steps: 16, gamma: 5.0}
+eval: {every: 10000, batch_size: 256, num_samples: 20, save_dir: runs/graph_coloring8}

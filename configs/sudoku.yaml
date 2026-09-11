@@ -1,0 +1,17 @@
+# Sudoku-Extreme: 5M MLP-Mixer denoiser (Table 5 hyperparameters).
+task: {name: sudoku, num_train: 1000}
+model: {mixer: mlp, L_cycles: 6}
+train:
+  total_steps: 100000
+  batch_size: 768
+  k: 16
+  time_sampler: sorted
+  pseudotargets: true
+  pseudotarget_ramp_steps: 20000
+  lr: 1.0e-4
+  warmup_steps: 2000
+  lr_schedule: cosine
+  lr_min_ratio: 0.1
+  weight_decay: 2.0
+sample: {n_steps: 128, gamma: 5.0}
+eval: {every: 10000, batch_size: 512, limit: 10000, save_dir: runs/sudoku}
