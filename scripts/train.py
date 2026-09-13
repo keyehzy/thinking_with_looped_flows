@@ -23,7 +23,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("config", nargs="?", default=None)
     ap.add_argument("overrides", nargs="*", help="dotted overrides, e.g. train.total_steps=1000")
-    ap.add_argument("--resume", default=None)
+    ap.add_argument("--resume", default=None, help="checkpoint to continue (model, optimiser, EMA and step)")
+    ap.add_argument("--init-from", default=None, help="checkpoint whose EMA weights initialise a fresh run (e.g. mate -> Stockfish stage)")
     args = ap.parse_args()
 
     cfg = load_config(args.config, args.overrides)
@@ -36,6 +37,10 @@ def main():
     task = build_task_from_config(cfg)
     model = LoopedFlowDenoiser(build_model_config(task, cfg))
     print(f"task={task.spec.name} seq_len={task.spec.seq_len} vocab={task.spec.vocab_size} params={model.num_parameters()/1e6:.2f}M device={device}")
+    if args.init_from:
+        sd = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(sd["ema"])
+        print(f"initialised weights from {args.init_from}")
     trainer = Trainer(task, model, cfg.train, device)
     if args.resume:
         trainer.load_state_dict(torch.load(args.resume, map_location="cpu", weights_only=False))

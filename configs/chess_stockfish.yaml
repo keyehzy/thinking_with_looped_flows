@@ -1,0 +1,18 @@
+# Stage 2: general positions labelled by Stockfish (best move plus every move within the margin).
+# Data: uv run python scripts/prepare_chess.py stockfish data/chess/stockfish --pgn <games.pgn.zst> ...
+#   or: uv run python scripts/prepare_chess.py evaldb data/raw/lichess/lichess_db_eval.jsonl.zst data/chess/stockfish
+# Start from the mate checkpoint with: scripts/train.py configs/chess_stockfish.yaml --init-from runs/chess_mate/checkpoint.pt
+task: {name: chess, root: data/chess/stockfish, target: best, augment: true}
+model: {mixer: attention, L_cycles: 4}
+train:
+  total_steps: 300000
+  batch_size: 768
+  k: 16
+  time_sampler: sorted
+  lr: 1.0e-4
+  warmup_steps: 2000
+  lr_schedule: cosine
+  weight_decay: 1.0
+  log_every: 100
+sample: {n_steps: 16, gamma: 5.0}
+eval: {every: 10000, batch_size: 256, num_samples: 20, limit: 2000, save_dir: runs/chess_stockfish}

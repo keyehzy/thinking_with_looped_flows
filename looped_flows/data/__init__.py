@@ -22,6 +22,10 @@ def build_task(name: str, **kwargs) -> Task:
         from .graph_coloring import GraphColoringTask
 
         return GraphColoringTask(**kwargs)
+    if name == "chess":
+        from .chess import ChessTask
+
+        return ChessTask(**kwargs)
     if name == "arc":
         from .arc import ARCTask
 

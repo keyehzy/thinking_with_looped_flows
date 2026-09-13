@@ -18,6 +18,7 @@ probability flow coupled with the recurrent state.
 | Convergence / spurious-attractor analysis (Sec. 4.1) | `looped_flows/evaluate.py` |
 | Sudoku-Extreme, Maze-Hard, ARC-AGI-1/2, N-Queens, Graph Colouring | `looped_flows/data/` |
 | Table 5 hyperparameters | `configs/*.yaml` |
+| Chess (not in the paper): mate-in-N puzzles, Stockfish-labelled positions | `looped_flows/data/chess.py`, `scripts/prepare_chess.py`, `configs/chess_*.yaml` |
 
 The denoiser is one TRM supervision step: a 2-layer, width-512 network `F` (SwiGLU 1536,
 post RMSNorm; MLP-Mixer for Sudoku, 8-head RoPE attention otherwise) applied as
@@ -99,6 +100,70 @@ uv run python scripts/train.py configs/maze.yaml train.total_steps=6 train.batch
   for intermediate evaluations.
 * The Sudoku test set has 423k puzzles; `eval.limit` controls how many are used during training.
 * The trainer is single-process. For multi-GPU, wrap `Trainer.train_step` in DDP or run seeds in parallel.
+
+## Chess
+
+Chess is posed as "predict the board after the best move": the position is the fixed problem
+(embedded like the graph-colouring adjacency matrix) and the target is the resulting board on the
+same 64 positions, so no move vocabulary is needed. Positions are normalised so the side to move is
+always White (Black-to-move positions are mirrored and colour-swapped); two extra tokens carry
+castling rights and the en-passant file. Sequence length 66, vocabulary 39, attention mixer.
+The predicted board is matched against the boards reachable by a legal move, which gives the
+`legal` rate, first-sample `accuracy`, `pass_at_k` over 20 samples, `majority` (vote over legal
+samples) and a per-depth breakdown `acc_mate<k>`. See `looped_flows/data/chess.py`.
+
+Two stages share the task and datasets are built by `scripts/prepare_chess.py`:
+
+```bash
+uv add chess zstandard                                   # already in pyproject.toml
+curl -L -o data/raw/lichess/lichess_db_puzzle.csv.zst https://database.lichess.org/lichess_db_puzzle.csv.zst
+
+# Stage 1: mate-in-N from Lichess puzzles (every solver-to-move position of a mate puzzle;
+# all mating moves are accepted on mate-in-1 positions). ~2.5M positions, a few minutes on 8 cores.
+uv run python scripts/prepare_chess.py puzzles data/raw/lichess/lichess_db_puzzle.csv.zst data/chess/mate
+uv run python scripts/train.py configs/chess_mate.yaml
+
+# Stage 2: general positions labelled by Stockfish. Either run an engine over positions sampled
+# from PGNs / a FEN list (multi-PV; moves within --margin centipawns of the best are accepted) ...
+brew install stockfish   # or apt install stockfish / a cluster module
+uv run python scripts/prepare_chess.py stockfish data/chess/stockfish --pgn games.pgn.zst \
+    --depth 14 --multipv 4 --margin 30 --workers 32 --limit 5000000
+# ... or convert Lichess' precomputed evaluations (no engine needed, ~30 GB download):
+curl -L -o data/raw/lichess/lichess_db_eval.jsonl.zst https://database.lichess.org/lichess_db_eval.jsonl.zst
+uv run python scripts/prepare_chess.py evaldb data/raw/lichess/lichess_db_eval.jsonl.zst data/chess/stockfish --min-depth 20
+uv run python scripts/train.py configs/chess_stockfish.yaml --init-from runs/chess_mate/checkpoint.pt
+```
+
+`task.target=any` draws the training target uniformly from the acceptable moves (as N-Queens draws
+among its solutions); `task.target=best` always uses the engine's first choice. `task.augment`
+mirrors files a-h on positions without castling rights (the only cheap symmetry chess has besides the
+colour flip already applied by normalisation). Splits are deterministic by puzzle id / FEN hash
+(`--test-fraction`, default 2%). Arrays are memory-mapped, so the Stockfish stage can use tens of
+millions of positions (128 bytes each).
+
+For a cluster, `scripts/train_chess.sbatch` wraps both stages (auto-resumes from the run's checkpoint):
+
+```bash
+sbatch scripts/train_chess.sbatch configs/chess_mate.yaml
+sbatch scripts/train_chess.sbatch configs/chess_stockfish.yaml --init-from runs/chess_mate/checkpoint.pt
+```
+
+Local check on the M4 (`train.batch_size=128 train.total_steps=1500 train.warmup_steps=200`, ~1.6 s/step,
+256 test positions, 5 samples, 16 SDE steps, gamma = 5; log in `runs/local_chess_mate.log`):
+
+| step | 500 | 1000 | 1500 |
+| --- | --- | --- | --- |
+| mean squares wrong vs target (1 sample) | ~16 | ~2 | - |
+| legal-move rate | 0.0 | 0.0 | 0.002 |
+| pass@5 (acceptable move among 5 samples) | 0.0 | 0.0 | 0.008 |
+
+At step 1000 the model copies the position and vacates the right origin square in two thirds of
+the positions but rarely places the piece correctly; the first legal mating moves appear at step
+1500. As with the N-Queens local run this is far below the paper's budget and only shows the
+pipeline learns; converged numbers need the GPU runs.
+
+Quick pipeline check without the full data: `--limit 20000` on the prepare step, then the usual
+6-step smoke command with `task.root=data/chess/mate_small`.
 
 ## Assumptions and departures from the paper
 
