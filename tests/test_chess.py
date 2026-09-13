@@ -166,3 +166,78 @@ def test_queenside_king_takes_rook_castling():
         tb = decode_board(a["board"], a["castling"], a["ep"])
         after = apply_move_tokens(a["board"][None], np.array([a["ep"]], dtype=np.uint8), a["moves"][0][None])[0]
         assert after.tobytes() in set(ChessTask.reachable(tb)), f"{ktr}: target unreachable"
+
+
+def _pvs(*pairs):
+    return [(chess.Move.from_uci(u), s) for u, s in pairs]
+
+
+def test_mates_are_scored_on_their_own_scale():
+    """Folding a mate into centipawns puts mate-in-1 and mate-in-2 one unit apart, so a 30 cp
+    margin used to accept any mate within ~30 plies -- and non-mating moves never mix in."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from prepare_chess import MATE_SCORE, acceptable_from_pvs
+
+    M = MATE_SCORE
+    pvs = _pvs(("a1a2", M - 1), ("b1b2", M - 5), ("c1c2", M - 25), ("d1d2", 900))
+    moves, mate_in = acceptable_from_pvs(pvs, margin=30)
+    assert mate_in == 1
+    assert [m.uci() for m in moves] == ["a1a2"], "only the fastest mate by default"
+
+    moves, _ = acceptable_from_pvs(pvs, margin=30, mate_margin=4)
+    assert [m.uci() for m in moves] == ["a1a2", "b1b2"], "mate_margin counts plies, not centipawns"
+
+    moves, _ = acceptable_from_pvs(pvs, margin=30, mate_margin=100)
+    assert "d1d2" not in [m.uci() for m in moves], "a merely-winning move is never an acceptable mate"
+
+    # non-mate positions keep the centipawn margin
+    moves, mate_in = acceptable_from_pvs(_pvs(("a1a2", 120), ("b1b2", 100), ("c1c2", 60)), margin=30)
+    assert mate_in == 0 and [m.uci() for m in moves] == ["a1a2", "b1b2"]
+
+
+def test_writer_slices_are_disjoint_and_cover(tmp_path):
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from prepare_chess import Writer
+
+    keys = [f"pos{i}" for i in range(1000)]
+    got = []
+    for i in range(4):
+        w = Writer(str(tmp_path / f"s{i}"), 0.0, shard=(i, 4))
+        got.append({k for k in keys if w.add(k, {"moves": [], "x": k})})
+    assert sum(len(g) for g in got) == len(keys), "shards must cover every key"
+    for i in range(4):
+        for j in range(i + 1, 4):
+            assert not (got[i] & got[j]), "shards must be disjoint"
+
+    # skip acts as a sequential cursor
+    a = Writer(str(tmp_path / "a"), 0.0)
+    for k in keys:
+        a.add(k, {"moves": [], "x": k})
+    b = Writer(str(tmp_path / "b"), 0.0, skip=600)
+    kept_b = [k for k in keys if b.add(k, {"moves": [], "x": k})]
+    assert a.count == 1000 and b.count == 400 and kept_b == keys[600:]
+
+
+def test_evaldb_scores_are_converted_from_white_pov():
+    """lichess_db_eval reports cp/mate from White's point of view. Treating them as
+    side-to-move relative inverts every Black-to-move position, picking the worst move."""
+    import json, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from prepare_chess import evaldb_example
+
+    # Black to move; White mates in 1 after g8f8, so a Black player must avoid it.
+    fen = "2r1r1k1/5p2/6R1/4NQp1/P7/1q5P/5PP1/4R1K1 b - -"
+    rec = {"fen": fen, "evals": [{"depth": 30, "knodes": 1, "pvs": [
+        {"mate": 1, "line": "g8f8"}, {"mate": 2, "line": "g8h8"}, {"mate": 15, "line": "f7g6"}]}]}
+    _, ex = evaldb_example(json.dumps(rec), 20, 30)
+    board = chess.Board(fen)
+    chosen = [decode_move(m) for m in ex["moves"]]
+    # the label is stored in the mirrored (White-to-move) frame, so mirror back to compare
+    back = [chess.Move(chess.square_mirror(m.from_square), chess.square_mirror(m.to_square), m.promotion)
+            for m in chosen]
+    assert all(m in board.legal_moves for m in back)
+    assert chess.Move.from_uci("g8f8") not in back, "picked the move that lets White mate fastest"
+    assert chess.Move.from_uci("f7g6") in back, "should prefer the longest resistance"
+    assert ex["mate_in"] == 0, "the mover is not the one delivering mate"

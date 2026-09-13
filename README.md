@@ -128,11 +128,37 @@ uv run python scripts/train.py configs/chess_mate.yaml
 brew install stockfish   # or apt install stockfish / a cluster module
 uv run python scripts/prepare_chess.py stockfish data/chess/stockfish --pgn games.pgn.zst \
     --depth 14 --multipv 4 --margin 30 --workers 32 --limit 5000000
-# ... or convert Lichess' precomputed evaluations (no engine needed, ~30 GB download):
-curl -L -o data/raw/lichess/lichess_db_eval.jsonl.zst https://database.lichess.org/lichess_db_eval.jsonl.zst
-uv run python scripts/prepare_chess.py evaldb data/raw/lichess/lichess_db_eval.jsonl.zst data/chess/stockfish --min-depth 20
+# ... or convert Lichess' precomputed evaluations (no engine needed, depth 20+ labels). The
+# database is ~22 GB compressed; pass the URL and it is streamed and decompressed on the fly,
+# so with --limit only the prefix actually needed is transferred and nothing lands on disk:
+uv run python scripts/prepare_chess.py evaldb \
+    https://database.lichess.org/lichess_db_eval.jsonl.zst data/chess/stockfish \
+    --min-depth 20 --limit 5000000
 uv run python scripts/train.py configs/chess_stockfish.yaml --init-from runs/chess_mate/checkpoint.pt
 ```
+
+### Slices
+
+`--limit` counts kept positions, and `--skip` / `--shard` (on every mode) carve a source into
+disjoint pieces, so a later stage can train on data the first one never saw:
+
+```bash
+# sequential cursor: the second slice continues where the first stopped
+uv run python scripts/prepare_chess.py evaldb $EVAL_DB data/chess/sf_a --limit 5000000
+uv run python scripts/prepare_chess.py evaldb $EVAL_DB data/chess/sf_b --skip 5000000 --limit 5000000
+
+# or hashed shards, spread over the whole database rather than taken from the front
+uv run python scripts/prepare_chess.py evaldb $EVAL_DB data/chess/sf_0 --shard 0/8 --limit 2000000
+```
+
+`--shard I/N` is salted separately from the train/test hash, so shards stay disjoint and each
+still gets its own ~2% test split. Note `--limit` alone takes a **prefix** of the database, which
+inherits whatever ordering the file has; `--shard` samples across all of it.
+
+`--mate-margin` controls how much slower than the fastest mate a move may be and still count as
+acceptable (default 0, i.e. only the fastest). Mates are ranked on their own scale, so a merely
+winning move is never accepted in place of a mate, and when the mover is the one being mated the
+acceptable moves are those that resist longest.
 
 `task.target=any` draws the training target uniformly from the acceptable moves (as N-Queens draws
 among its solutions); `task.target=best` always uses the engine's first choice. `task.augment`

@@ -39,11 +39,52 @@ from tqdm import tqdm
 from looped_flows.data.chess import encode_board, encode_move, normalize, pad_moves, write_split
 
 MATE_SCORE = 100_000
+EVAL_DB_URL = "https://database.lichess.org/lichess_db_eval.jsonl.zst"
+
+
+def default_workers() -> int:
+    """CPUs this process may actually use. ``os.cpu_count()`` reports the host's cores, which
+    inside a cpu-quota'd container badly oversubscribes the pool -- enough, with an engine
+    loading a ~100 MB NNUE net per worker, to push the UCI handshake past its timeout."""
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:  # cgroup v2
+            quota, period = f.read().split()
+            if quota != "max":
+                n = min(n, max(1, int(int(quota) / int(period))))
+    except OSError:
+        try:
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:  # cgroup v1
+                quota = int(f.read())
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+                period = int(f.read())
+            if quota > 0:
+                n = min(n, max(1, quota // period))
+        except OSError:
+            pass
+    return max(1, n)
+
+
+def shard_arg(text: str) -> tuple[int, int]:
+    i, n = (int(x) for x in text.split("/", 1))
+    if not 0 <= i < n:
+        raise argparse.ArgumentTypeError(f"--shard {text}: need 0 <= I < N")
+    return i, n
 
 
 # ----------------------------------------------------------------- utilities
 def open_text(path: str):
-    f = open(path, "rb")
+    """Open a local file or an http(s) URL, transparently decompressing ``.zst``.
+
+    The eval database is ~22 GB compressed, so streaming it straight from
+    database.lichess.org avoids ever landing it on disk; combined with ``--limit`` only the
+    prefix actually needed is transferred."""
+    if path.startswith(("http://", "https://")):
+        import urllib.request
+
+        f = urllib.request.urlopen(path)  # noqa: S310 - fixed, user-supplied database URL
+    else:
+        f = open(path, "rb")
     if path.endswith(".zst"):
         import zstandard
 
@@ -75,13 +116,35 @@ def make_example(board: chess.Board, moves: list[chess.Move], mate_in: int) -> d
 
 
 class Writer:
-    def __init__(self, out: str, test_fraction: float):
+    """Collects examples and splits them train/test.
+
+    ``shard=(i, n)`` keeps only the positions whose key hashes into shard ``i`` of ``n``, and
+    ``skip`` drops that many accepted positions before collecting. Either one carves disjoint
+    slices out of the same source -- shards are spread over the whole database, while skip is
+    a cheap sequential cursor for "the next N after the ones I already built". ``count`` is
+    what the callers compare against ``--limit``, so the limit counts kept positions."""
+
+    def __init__(self, out: str, test_fraction: float, skip: int = 0, shard: tuple[int, int] | None = None):
         self.out = out
         self.test_fraction = test_fraction
+        self.skip = skip
+        self.shard = shard
+        self.seen = 0
+        self.count = 0
         self.splits = {"train": [], "test": []}
 
-    def add(self, key: str, ex: dict):
+    def add(self, key: str, ex: dict) -> bool:
+        if self.shard is not None:
+            i, n = self.shard
+            # salted so shard membership is independent of the train/test hash
+            if zlib.crc32(f"shard:{key}".encode()) % n != i:
+                return False
+        self.seen += 1
+        if self.seen <= self.skip:
+            return False
         self.splits["test" if is_test(key, self.test_fraction) else "train"].append(ex)
+        self.count += 1
+        return True
 
     def finish(self):
         width = max((len(e["moves"]) for s in self.splits.values() for e in s), default=1)
@@ -146,7 +209,7 @@ def _puzzle_chunk(args):
 
 def cmd_puzzles(a):
     wanted = {int(x) for x in a.mate_in.split(",")}
-    writer = Writer(a.out, a.test_fraction)
+    writer = Writer(a.out, a.test_fraction, a.skip, a.shard)
     reader = csv.DictReader(open_text(a.csv))
 
     def chunks():
@@ -161,13 +224,11 @@ def cmd_puzzles(a):
         if buf:
             yield buf, wanted
 
-    n = 0
     with Pool(a.workers) as pool:
         for exs in tqdm(pool.imap(_puzzle_chunk, chunks()), unit="chunk"):
             for key, ex in exs:
                 writer.add(key, ex)
-            n += len(exs)
-            if a.limit and n >= a.limit:
+            if a.limit and writer.count >= a.limit:
                 pool.terminate()
                 break
     writer.finish()
@@ -196,14 +257,39 @@ def iter_fen_file(path: str):
                 yield line
 
 
-def acceptable_from_pvs(pvs: list[tuple[chess.Move, int]], margin: int) -> tuple[list[chess.Move], int]:
+def is_mate_score(score: int) -> bool:
+    """The mover delivers mate (folded score MATE_SCORE - plies)."""
+    return score > MATE_SCORE - 1000
+
+
+def is_mated_score(score: int) -> bool:
+    """The mover gets mated (folded score -MATE_SCORE + plies of resistance)."""
+    return score < -MATE_SCORE + 1000
+
+
+def acceptable_from_pvs(pvs: list[tuple[chess.Move, int]], margin: int, mate_margin: int = 0) -> tuple[list[chess.Move], int]:
     """pvs: (move, score from the mover's view, mate distances folded into MATE_SCORE-ply).
-    Returns the moves within ``margin`` centipawns of the best one and the mate depth of the best."""
+
+    Mates are ranked on their own scale rather than through ``margin``. Folding a mate into the
+    centipawn scale puts mate-in-1 and mate-in-2 one "centipawn" apart, so a 30 cp margin used to
+    accept every mate within ~30 plies of the best -- on 64% of mate-in-1 positions it admitted a
+    move that does not mate at all. When the best move mates, only moves that also mate within
+    ``mate_margin`` plies of the fastest are acceptable, and a merely-winning move never is.
+    Otherwise the usual centipawn ``margin`` applies."""
     pvs = sorted(pvs, key=lambda p: -p[1])
     best = pvs[0][1]
+    if is_mate_score(best):
+        best_ply = MATE_SCORE - best
+        moves = [m for m, s in pvs if is_mate_score(s) and MATE_SCORE - s <= best_ply + mate_margin]
+        return moves, min(best_ply, 255)
+    if is_mated_score(best):
+        # Every move loses; rank by how long they resist, not by a centipawn margin (which on the
+        # folded scale would accept walking into the fastest mate).
+        best_ply = best + MATE_SCORE
+        moves = [m for m, s in pvs if is_mated_score(s) and s + MATE_SCORE >= best_ply - mate_margin]
+        return moves, 0
     moves = [m for m, s in pvs if s >= best - margin]
-    mate_in = MATE_SCORE - best if best > MATE_SCORE - 1000 else 0
-    return moves, min(mate_in, 255)
+    return moves, 0
 
 
 _engine = None
@@ -220,7 +306,7 @@ def _engine_init(path: str, threads: int, hash_mb: int, timeout: float | None):
 
 
 def _engine_label(args):
-    fen, depth, nodes, multipv, margin = args
+    fen, depth, nodes, multipv, margin, mate_margin = args
     board = chess.Board(fen)
     if board.is_game_over():
         return None
@@ -233,7 +319,7 @@ def _engine_label(args):
         pvs.append((info["pv"][0], info["score"].relative.score(mate_score=MATE_SCORE)))
     if not pvs:
         return None
-    moves, mate_in = acceptable_from_pvs(pvs, margin)
+    moves, mate_in = acceptable_from_pvs(pvs, margin, mate_margin)
     return fen, make_example(board, moves, mate_in)
 
 
@@ -244,23 +330,21 @@ def cmd_stockfish(a):
         fens = iter_fen_file(a.fens)
     else:
         raise SystemExit("stockfish mode needs --pgn or --fens")
-    writer = Writer(a.out, a.test_fraction)
-    jobs = ((fen, a.depth, a.nodes, a.multipv, a.margin) for fen in fens)
-    n = 0
+    writer = Writer(a.out, a.test_fraction, a.skip, a.shard)
+    jobs = ((fen, a.depth, a.nodes, a.multipv, a.margin, a.mate_margin) for fen in fens)
     with Pool(a.workers, initializer=_engine_init, initargs=(a.engine, a.threads, a.hash, a.engine_timeout)) as pool:
         for res in tqdm(pool.imap_unordered(_engine_label, jobs, chunksize=8), unit="pos"):
             if res is None:
                 continue
             writer.add(*res)
-            n += 1
-            if a.limit and n >= a.limit:
+            if a.limit and writer.count >= a.limit:
                 pool.terminate()
                 break
     writer.finish()
 
 
 # --------------------------------------------------------------------- evaldb
-def evaldb_example(line: str, min_depth: int, margin: int):
+def evaldb_example(line: str, min_depth: int, margin: int, mate_margin: int = 0):
     rec = json.loads(line)
     evals = [e for e in rec["evals"] if e.get("depth", 0) >= min_depth]
     if not evals:
@@ -280,25 +364,32 @@ def evaldb_example(line: str, min_depth: int, margin: int):
             score = MATE_SCORE - m if m > 0 else -MATE_SCORE - m
         else:
             score = pv["cp"]
+        # The Lichess eval database reports cp and mate from WHITE's point of view, whereas
+        # acceptable_from_pvs (and the engine path, which uses score.relative) works in the
+        # mover's frame. Without this flip every Black-to-move position selected the move that
+        # is best for White, i.e. the worst legal move: 0 of 665 sampled "mate in 1" labels
+        # with Black to move actually mated, against 532 of 532 with White to move.
+        if board.turn == chess.BLACK:
+            score = -score
         pvs.append((move, score))
     if not pvs:
         return None
-    moves, mate_in = acceptable_from_pvs(pvs, margin)
+    moves, mate_in = acceptable_from_pvs(pvs, margin, mate_margin)
     return rec["fen"], make_example(board, moves, mate_in)
 
 
 def _evaldb_chunk(args):
-    lines, min_depth, margin = args
+    lines, min_depth, margin, mate_margin = args
     out = []
     for line in lines:
-        ex = evaldb_example(line, min_depth, margin)
+        ex = evaldb_example(line, min_depth, margin, mate_margin)
         if ex is not None:
             out.append(ex)
     return out
 
 
 def cmd_evaldb(a):
-    writer = Writer(a.out, a.test_fraction)
+    writer = Writer(a.out, a.test_fraction, a.skip, a.shard)
 
     def chunks():
         buf = []
@@ -306,18 +397,16 @@ def cmd_evaldb(a):
             for line in f:
                 buf.append(line)
                 if len(buf) == 2000:
-                    yield buf, a.min_depth, a.margin
+                    yield buf, a.min_depth, a.margin, a.mate_margin
                     buf = []
         if buf:
-            yield buf, a.min_depth, a.margin
+            yield buf, a.min_depth, a.margin, a.mate_margin
 
-    n = 0
     with Pool(a.workers) as pool:
         for exs in tqdm(pool.imap(_evaldb_chunk, chunks()), unit="chunk"):
             for key, ex in exs:
                 writer.add(key, ex)
-            n += len(exs)
-            if a.limit and n >= a.limit:
+            if a.limit and writer.count >= a.limit:
                 pool.terminate()
                 break
     writer.finish()
@@ -330,8 +419,11 @@ def main():
 
     def common(p):
         p.add_argument("--test-fraction", type=float, default=0.02)
-        p.add_argument("--limit", type=int, default=None, help="stop after this many positions")
-        p.add_argument("--workers", type=int, default=os.cpu_count())
+        p.add_argument("--limit", type=int, default=None, help="stop after this many kept positions")
+        p.add_argument("--skip", type=int, default=0, help="drop this many kept positions first; with --limit this walks successive slices of one source")
+        p.add_argument("--shard", type=shard_arg, default=None, metavar="I/N",
+                       help="keep only shard I of N (hashed on the position key), for disjoint slices spread over the whole source")
+        p.add_argument("--workers", type=int, default=default_workers(), help="worker processes (defaults to the CPUs actually available to this process/cgroup)")
 
     p = sub.add_parser("puzzles", help="mate-in-N positions from lichess_db_puzzle.csv(.zst)")
     p.add_argument("csv")
@@ -352,16 +444,18 @@ def main():
     p.add_argument("--nodes", type=int, default=None, help="node limit instead of depth")
     p.add_argument("--multipv", type=int, default=4)
     p.add_argument("--margin", type=int, default=30, help="centipawns within the best move that count as acceptable")
+    p.add_argument("--mate-margin", type=int, default=0, help="when the best move mates, also accept mates this many plies slower (0 = only the fastest)")
     p.add_argument("--threads", type=int, default=1, help="engine threads per worker")
     p.add_argument("--hash", type=int, default=64, help="engine hash (MB) per worker")
     p.add_argument("--engine-timeout", type=float, default=120.0, help="seconds to allow for engine startup (NNUE load); 0 = wait forever")
     common(p)
 
-    p = sub.add_parser("evaldb", help="convert lichess_db_eval.jsonl(.zst)")
-    p.add_argument("jsonl")
+    p = sub.add_parser("evaldb", help="convert lichess_db_eval.jsonl(.zst); accepts a local path or an http(s) URL streamed on the fly")
+    p.add_argument("jsonl", help=f"local .jsonl(.zst) path, or a URL (default source: {EVAL_DB_URL})")
     p.add_argument("out")
     p.add_argument("--min-depth", type=int, default=20)
     p.add_argument("--margin", type=int, default=30)
+    p.add_argument("--mate-margin", type=int, default=0, help="when the best move mates, also accept mates this many plies slower (0 = only the fastest)")
     common(p)
 
     a = ap.parse_args()
