@@ -55,11 +55,22 @@ def is_test(key: str, fraction: float) -> bool:
     return (zlib.crc32(key.encode()) % 100_000) < int(fraction * 100_000)
 
 
+def canonical_castling(board: chess.Board, move: chess.Move) -> chess.Move:
+    """python-chess accepts castling both as e1g1 and as the king-takes-rook e1h1 (the form the
+    Lichess eval database writes in its PV lines), and ``move in board.legal_moves`` is true for
+    either. Only the first form satisfies the ``to - from == 2`` test in ``apply_move_tokens``,
+    and only it compares equal to what ``ChessTask.reachable`` yields, so canonicalise here --
+    the one place every mode funnels through."""
+    if board.is_castling(move):
+        return chess.Move.from_uci(board.uci(move, chess960=False))
+    return move
+
+
 def make_example(board: chess.Board, moves: list[chess.Move], mate_in: int) -> dict:
     """Encode a position and its acceptable moves (first = preferred) in the White-to-move frame."""
     nb, _ = normalize(board)
     tokens, castling, ep = encode_board(nb)
-    enc = [encode_move(normalize(board, m)[1]) for m in moves]
+    enc = [encode_move(normalize(board, canonical_castling(board, m))[1]) for m in moves]
     return {"board": tokens, "castling": castling, "ep": ep, "moves": enc, "mate_in": mate_in, "fen": board.fen()}
 
 

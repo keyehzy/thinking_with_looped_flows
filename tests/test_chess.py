@@ -131,3 +131,38 @@ def test_mate_dataset_labels_are_mates():
             b = board.copy()
             b.push(m)
             assert b.is_checkmate() == (ex["mate_in"][i] == 1)
+
+
+def test_king_takes_rook_castling_is_canonicalised():
+    """The Lichess eval database writes castling as king-takes-rook (e1h1); python-chess accepts
+    it in `legal_moves` but apply_move_tokens only understands the e1g1 form, and reachable()
+    only ever yields e1g1. Both conventions must land on the same encoded move."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from prepare_chess import make_example
+
+    fen = "r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1"
+    board = chess.Board(fen)
+    for ktr, std in (("e1h1", "e1g1"),):
+        a = make_example(board, [chess.Move.from_uci(ktr)], 0)
+        b = make_example(board, [chess.Move.from_uci(std)], 0)
+        assert (a["moves"][0] == b["moves"][0]).all(), f"{ktr} did not canonicalise to {std}"
+        # and the encoded target must be a board an actual legal move can produce
+        task_board = decode_board(a["board"], a["castling"], a["ep"])
+        after = apply_move_tokens(a["board"][None], np.array([a["ep"]], dtype=np.uint8), a["moves"][0][None])[0]
+        assert after.tobytes() in {k for k in ChessTask.reachable(task_board)}
+
+
+def test_queenside_king_takes_rook_castling():
+    fen = "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1"
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    from prepare_chess import make_example
+    board = chess.Board(fen)
+    for ktr, std in (("e1a1", "e1c1"), ("e1h1", "e1g1")):
+        a = make_example(board, [chess.Move.from_uci(ktr)], 0)
+        b = make_example(board, [chess.Move.from_uci(std)], 0)
+        assert (a["moves"][0] == b["moves"][0]).all(), f"{ktr} != {std}"
+        tb = decode_board(a["board"], a["castling"], a["ep"])
+        after = apply_move_tokens(a["board"][None], np.array([a["ep"]], dtype=np.uint8), a["moves"][0][None])[0]
+        assert after.tobytes() in set(ChessTask.reachable(tb)), f"{ktr}: target unreachable"
