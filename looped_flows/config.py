@@ -37,6 +37,7 @@ class ModelOverrides:
     puzzle_emb_ndim: int = 512
     time_conditioning: bool = True
     forward_dtype: str = "bfloat16"
+    compile: bool = False  # torch.compile the shared core (and the carry update in training)
 
 
 @dataclass

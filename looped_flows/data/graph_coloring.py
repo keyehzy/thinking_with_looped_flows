@@ -100,7 +100,7 @@ class GraphColoringTask(Task):
     def test_batches(self, batch_size: int, limit: int | None = None):
         m = self.num_test(limit)
         for s in range(0, m, batch_size):
-            chunk = self.test_graphs[s : s + batch_size]
+            chunk = self.test_graphs[s : min(s + batch_size, m)]
             enc = [self._encode(adj, cols[0]) for adj, cols in chunk]
             inputs = np.stack([e[0] for e in enc])
             batch = self.to_batch(inputs, np.stack([e[1] for e in enc]), np.zeros_like(inputs, dtype=bool))

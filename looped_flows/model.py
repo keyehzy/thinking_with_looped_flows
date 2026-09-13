@@ -91,6 +91,13 @@ class LoopedFlowDenoiser(nn.Module):
 
         self.register_buffer("h_init", trunc_normal_init_(torch.empty(D), std=1.0), persistent=True)
         self.register_buffer("l_init", trunc_normal_init_(torch.empty(D), std=1.0), persistent=True)
+        self.__dict__["_core_fn"] = self.core  # plain attribute: not registered, so state_dict keys stay stable
+
+    def compile_core(self, **kwargs):
+        """Wrap the shared network in ``torch.compile``. The compiled callable is kept outside
+        the module tree so checkpoints are unaffected."""
+        self.__dict__["_core_fn"] = torch.compile(self.core, **kwargs)
+        return self
 
     # ------------------------------------------------------------------ state
     def initial_state(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -135,21 +142,25 @@ class LoopedFlowDenoiser(nn.Module):
         l: torch.Tensor,
         problem: torch.Tensor | None = None,
         puzzle_ids: torch.Tensor | None = None,
+        H_cycles: int | None = None,
     ) -> DenoiserOutput:
+        """``H_cycles`` overrides the number of recurrence cycles (e.g. fewer at inference)."""
         cfg = self.cfg
+        H_cycles = cfg.H_cycles if H_cycles is None else H_cycles
+        core = self._core_fn
         cos_sin = self.rotary() if self.rotary is not None else None
         e = self.encode(x_t, t, problem, puzzle_ids)
         h = h.detach()
         l = l.detach()
 
         with torch.no_grad():
-            for _ in range(cfg.H_cycles - 1):
+            for _ in range(H_cycles - 1):
                 for _ in range(cfg.L_cycles):
-                    l = self.core(l, h + e, cos_sin)
-                h = self.core(h, l, cos_sin)
+                    l = core(l, h + e, cos_sin)
+                h = core(h, l, cos_sin)
         for _ in range(cfg.L_cycles):
-            l = self.core(l, h + e, cos_sin)
-        h = self.core(h, l, cos_sin)
+            l = core(l, h + e, cos_sin)
+        h = core(h, l, cos_sin)
 
         logits = self.lm_head(h[:, cfg.puzzle_emb_len :]).float()
         q_logit = self.q_head(h[:, 0]).float().squeeze(-1)

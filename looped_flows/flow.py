@@ -61,6 +61,7 @@ class SampleConfig:
     sigma: float = 1.0
     prob_kind: str = "stablemax"
     record_states: bool = False
+    H_cycles: int | None = None  # override the denoiser's recurrence cycles at inference
 
 
 @dataclass
@@ -99,7 +100,7 @@ def sample(model: LoopedFlowDenoiser, batch: dict, cfg: SampleConfig, generator:
         std = math.sqrt(max(0.0, (1 - s) ** 2 - (a - s) ** 2))
         x_bar = a * x + std * noise()
         x_bar = fix_given(x_bar, given_mask, g_onehot)
-        out = model(x_bar, torch.full((B,), s, device=device), h, l, problem, puzzle_ids)
+        out = model(x_bar, torch.full((B,), s, device=device), h, l, problem, puzzle_ids, H_cycles=cfg.H_cycles)
         x_hat = probs(out.logits, cfg.prob_kind)
         x = x_bar + (t_next - s) * (x_hat - x_bar) / (1 - s)
         x = fix_given(x, given_mask, g_onehot)
@@ -118,19 +119,34 @@ def sample(model: LoopedFlowDenoiser, batch: dict, cfg: SampleConfig, generator:
     )
 
 
+def repeat_batch(batch: dict, r: int) -> dict:
+    """Repeat every problem r times along the batch axis (problem i occupies rows i*r .. i*r+r-1)."""
+    return {k: (v.repeat_interleave(r, dim=0) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+
+
 @torch.no_grad()
-def sample_best_q(model: LoopedFlowDenoiser, batch: dict, cfg: SampleConfig, num_trajectories: int) -> SampleResult:
-    """Run several independent trajectories and keep, per problem, the one with the highest halting score."""
-    best: SampleResult | None = None
-    for _ in range(num_trajectories):
-        res = sample(model, batch, cfg)
-        if best is None:
-            best = res
-            continue
-        better = res.q_logit > best.q_logit
-        best = SampleResult(
-            tokens=torch.where(better.unsqueeze(-1), res.tokens, best.tokens),
-            x=torch.where(better.view(-1, 1, 1), res.x, best.x),
-            q_logit=torch.where(better, res.q_logit, best.q_logit),
-        )
-    return best
+def sample_repeated(model: LoopedFlowDenoiser, batch: dict, cfg: SampleConfig, r: int, max_batch: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Draw r independent samples per problem in as few sampler calls as possible.
+    Returns tokens [B, r, L] and halting scores [B, r]. ``max_batch`` caps the number of
+    sequences per call (defaults to B * r, i.e. a single call)."""
+    B = batch["inputs"].shape[0]
+    rep = repeat_batch(batch, r)
+    total = B * r
+    max_batch = total if max_batch is None else max(1, max_batch)
+    tokens, q = [], []
+    for s in range(0, total, max_batch):
+        chunk = {k: (v[s : s + max_batch] if isinstance(v, torch.Tensor) else v) for k, v in rep.items()}
+        res = sample(model, chunk, cfg)
+        tokens.append(res.tokens)
+        q.append(res.q_logit)
+    return torch.cat(tokens).view(B, r, -1), torch.cat(q).view(B, r)
+
+
+@torch.no_grad()
+def sample_best_q(model: LoopedFlowDenoiser, batch: dict, cfg: SampleConfig, num_trajectories: int, max_batch: int | None = None) -> SampleResult:
+    """Run several independent trajectories (batched together) and keep, per problem, the one
+    with the highest halting score."""
+    tokens, q = sample_repeated(model, batch, cfg, num_trajectories, max_batch)
+    best = q.argmax(dim=1)
+    idx = torch.arange(tokens.shape[0], device=tokens.device)
+    return SampleResult(tokens=tokens[idx, best], x=F.one_hot(tokens[idx, best], model.cfg.vocab_size).float(), q_logit=q[idx, best])

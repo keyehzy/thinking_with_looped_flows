@@ -37,6 +37,8 @@ def main():
     model = LoopedFlowDenoiser(build_model_config(task, cfg))
     print(f"task={task.spec.name} seq_len={task.spec.seq_len} vocab={task.spec.vocab_size} params={model.num_parameters()/1e6:.2f}M device={device}")
     trainer = Trainer(task, model, cfg.train, device)
+    if cfg.model.compile:
+        trainer.compile()
     if args.resume:
         trainer.load_state_dict(torch.load(args.resume, map_location="cpu", weights_only=False))
         print(f"resumed from {args.resume} at step {trainer.step}")

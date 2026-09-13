@@ -64,6 +64,10 @@ Any config key can be overridden as `section.key=value`. Useful knobs:
 * Ablations: `model.time_conditioning=false`, `train.use_interpolant=false`,
   `train.decreasing_noise=false`, `train.share_noise=false`, `sample.gamma=0` (ODE).
 * `task.num_aug` / `task.num_test_aug` (ARC), `task.test_limit`, `eval.limit` to shrink runs.
+* `sample.H_cycles=1` — fewer recurrence cycles per denoiser call at inference only (training keeps 3).
+* `model.compile=true` — `torch.compile` the shared core (and the carry update during training).
+* Multi-sample evaluation (20 samples per problem, best-Q ensembling) is batched: `eval.batch_size`
+  counts *sequences* per sampler call, so 20 samples of 64 problems run as one call at 1280.
 
 Configs follow Table 5 (batch 768, lr 1e-4 with 2k warmup, Adam-atan2 (0.9, 0.95), grad clip 1,
 EMA 0.999, k = 16, lambda = 0.5, exploration 0.1, bf16 forward). `train.total_steps` is not
@@ -81,8 +85,20 @@ specified in the paper; the defaults (50k-200k) are ballpark and should be tuned
 | first-sample accuracy | 0.0 | 0.0 | 0.0 | 0.0 |
 
 This is ~0.3% of the paper's training budget (batch 768 for hours on an H100), so it only shows
-that the pipeline learns; converged numbers need the GPU runs. A 20-sample evaluation of 64
-puzzles takes ~4 minutes on MPS, so keep `eval.limit` small locally.
+that the pipeline learns; converged numbers need the GPU runs.
+
+Inference-time variants on the same step-2000 checkpoint (64 puzzles, 20 samples, gamma = 5):
+
+| inference | coverage | first-sample acc. | eval time (MPS) |
+| --- | --- | --- | --- |
+| 3 cycles, 32 steps (paper default) | 0.138 | 0.000 | 280 s |
+| 1 cycle, 32 steps | 0.211 | 0.000 | 93 s |
+| 1 cycle, 96 steps (equal compute) | 0.133 | 0.016 | 288 s |
+
+With 64 puzzles these differences are within noise, but a single cycle is not worse here at a third
+of the cost, so `sample.H_cycles` is worth sweeping on the GPU runs. Batching the 20 samples into one
+call gave no speedup on MPS (the M4 is already compute-bound at batch 64, ~3 TFLOP/s); on an H100
+the same change should help substantially.
 For a quick shape/NaN check of any task:
 
 ```bash

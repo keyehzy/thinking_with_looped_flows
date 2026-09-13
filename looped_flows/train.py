@@ -103,6 +103,31 @@ class Trainer:
         self.step = 0
         self.carry: Carry | None = None
         self.stats = RunningStats()
+        self._advance_fn = self._advance
+
+    def compile(self, **kwargs):
+        """Compile the shared core and the carry-advance step."""
+        self.model.compile_core(**kwargs)
+        self._advance_fn = torch.compile(self._advance, **kwargs)
+        return self
+
+    @torch.no_grad()
+    def _advance(self, c: Carry, h, l, logits, q_logit, pred, correct, t):
+        """Post-step carry update: new recurrent state, halting decision and running statistics."""
+        cfg = self.cfg
+        B = q_logit.shape[0]
+        c.h, c.l = h, l
+        c.prev_probs = probs(logits, cfg.loss_kind)
+        c.step += 1
+        is_last = c.step >= cfg.k
+        halt = is_last | (q_logit > 0)
+        explore = torch.rand(B, device=q_logit.device) < cfg.exploration_prob
+        min_steps = explore * torch.randint(2, cfg.k + 1, (B,), device=q_logit.device)
+        c.halted = halt & (c.step >= min_steps)
+        valid = c.labels != IGNORE_LABEL_ID
+        tok_acc = ((pred == c.labels) & valid).sum() / valid.sum().clamp_min(1)
+        q_acc = ((q_logit > 0) == correct).float().mean()
+        return torch.stack([tok_acc, correct.float().mean(), q_acc, c.halted.float().mean(), t.mean()])
 
     # ------------------------------------------------------------------ carry
     def _empty_carry(self) -> Carry:
@@ -199,24 +224,11 @@ class Trainer:
         self.ema.update(self.model)
         self.step += 1
 
-        with torch.no_grad():
-            c.h, c.l = out.h, out.l
-            c.prev_probs = probs(out.logits, cfg.loss_kind)
-            c.step += 1
-            is_last = c.step >= cfg.k
-            halt = is_last | (out.q_logit > 0)
-            explore = torch.rand(B, device=dev) < cfg.exploration_prob
-            min_steps = explore * torch.randint(2, cfg.k + 1, (B,), device=dev)
-            c.halted = halt & (c.step >= min_steps)
-
-            valid = c.labels != IGNORE_LABEL_ID
-            tok_acc = ((pred == c.labels) & valid).sum() / valid.sum().clamp_min(1)
-            q_acc = ((out.q_logit > 0) == correct).float().mean()
-            self.stats.add(
-                loss=loss.item(), ce=ce.mean().item(), act=act.mean().item(), tok_acc=tok_acc.item(),
-                seq_acc=correct.float().mean().item(), q_acc=q_acc.item(), halt_rate=c.halted.float().mean().item(),
-                mean_t=t.mean().item(), gnorm=float(gnorm), lr=lr, pt_prob=p_pt,
-            )
+        tok_acc, seq_acc, q_acc, halt_rate, mean_t = self._advance_fn(c, out.h, out.l, out.logits.detach(), out.q_logit.detach(), pred, correct, t).tolist()
+        self.stats.add(
+            loss=loss.item(), ce=ce.mean().item(), act=act.mean().item(), tok_acc=tok_acc, seq_acc=seq_acc, q_acc=q_acc,
+            halt_rate=halt_rate, mean_t=mean_t, gnorm=float(gnorm), lr=lr, pt_prob=p_pt,
+        )
         return {"loss": loss.item()}
 
     # ------------------------------------------------------------ checkpoint

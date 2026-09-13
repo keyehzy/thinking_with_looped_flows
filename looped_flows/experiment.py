@@ -74,6 +74,7 @@ def run_evaluation(model: LoopedFlowDenoiser, task: Task, cfg: ExperimentConfig,
     out["eval_seconds"] = time.time() - t0
     out["n_steps"] = sample_cfg.n_steps
     out["gamma"] = sample_cfg.gamma
+    out["H_cycles"] = sample_cfg.H_cycles if sample_cfg.H_cycles is not None else model.cfg.H_cycles
     return out
 
 

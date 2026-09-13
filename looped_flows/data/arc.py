@@ -206,7 +206,7 @@ class ARCTask(Task):
                 for a in range(self.num_test_aug):
                     items.append((pi, ei, a))
         for s in range(0, len(items), batch_size):
-            chunk = items[s : s + batch_size]
+            chunk = items[s : min(s + batch_size, len(items))]
             inputs, labels, ids = [], [], []
             for pi, ei, a in chunk:
                 p = self.test_puzzles[pi]
@@ -228,7 +228,7 @@ class ARCTask(Task):
         done = 0
         for batch in self.test_batches(batch_size, limit):
             b = batch_to(batch, device)
-            res = sample(model, b, sample_cfg) if num_trajectories == 1 else sample_best_q(model, b, sample_cfg, num_trajectories)
+            res = sample(model, b, sample_cfg) if num_trajectories == 1 else sample_best_q(model, b, sample_cfg, num_trajectories, max_batch=batch_size)
             tokens = res.tokens.cpu().numpy()
             for (pi, ei, a), seq in zip(batch["keys"], tokens):
                 grid = inverse_augment_grid(decode_grid(seq), self.test_puzzles[pi].augs[a])

@@ -112,3 +112,39 @@ def test_lr_schedule():
     assert lr_at(0, 1.0, 10, 100, "constant") == pytest.approx(0.1)
     assert lr_at(10, 1.0, 10, 100, "constant") == 1.0
     assert lr_at(100, 1.0, 10, 100, "cosine", 0.1) == pytest.approx(0.1)
+
+
+def test_sample_repeated_and_best_q_batched():
+    torch.manual_seed(0)
+    m = small_model().eval()
+    inputs = torch.tensor([[1, 0, 2, 0, 0, 0], [0, 0, 0, 0, 3, 0]])
+    batch = {"inputs": inputs, "labels": inputs, "puzzle_ids": torch.zeros(2, dtype=torch.long), "given_mask": inputs != 0}
+    from looped_flows.flow import sample_best_q, sample_repeated
+
+    cfg = SampleConfig(n_steps=3, gamma=1.0, sigma=1.0, prob_kind="softmax")
+    tokens, q = sample_repeated(m, batch, cfg, r=5, max_batch=4)
+    assert tokens.shape == (2, 5, 6) and q.shape == (2, 5)
+    assert (tokens[0, :, 0] == 1).all() and (tokens[1, :, 4] == 3).all()
+    best = sample_best_q(m, batch, cfg, num_trajectories=5, max_batch=4)
+    assert best.tokens.shape == (2, 6)
+
+
+def test_h_cycles_override_changes_output():
+    torch.manual_seed(0)
+    m = small_model().eval()
+    B = 2
+    h, l = m.initial_state(B)
+    x = torch.randn(B, 6, 5)
+    t = torch.rand(B)
+    ids = torch.zeros(B, dtype=torch.long)
+    full = m(x, t, h, l, None, ids).logits
+    one = m(x, t, h, l, None, ids, H_cycles=1).logits
+    assert not torch.allclose(full, one)
+    assert torch.allclose(full, m(x, t, h, l, None, ids, H_cycles=2).logits)
+
+
+def test_compile_core_keeps_state_dict_keys():
+    m = small_model()
+    keys = set(m.state_dict().keys())
+    m.compile_core()
+    assert set(m.state_dict().keys()) == keys

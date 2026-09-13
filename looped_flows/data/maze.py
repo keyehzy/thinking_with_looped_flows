@@ -78,6 +78,6 @@ class MazeTask(Task):
         return len(self.test_q) if limit is None else min(limit, len(self.test_q))
 
     def test_batches(self, batch_size: int, limit: int | None = None):
-        n = self.num_test(limit)
-        for s in range(0, n, batch_size):
-            yield self._encode(self.test_q[s : s + batch_size], self.test_a[s : s + batch_size])
+        m = self.num_test(limit)
+        for s in range(0, m, batch_size):
+            yield self._encode(self.test_q[s : min(s + batch_size, m)], self.test_a[s : min(s + batch_size, m)])

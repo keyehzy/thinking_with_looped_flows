@@ -105,7 +105,7 @@ class NQueensTask(Task):
     def test_batches(self, batch_size: int, limit: int | None = None):
         m = self.num_test(limit)
         for s in range(0, m, batch_size):
-            chunk = self.test_puzzles[s : s + batch_size]
+            chunk = self.test_puzzles[s : min(s + batch_size, m)]
             enc = [self._encode_puzzle(shown, sols[0]) for shown, sols in chunk]
             batch = self.to_batch(np.stack([e[0] for e in enc]), np.stack([e[1] for e in enc]), np.stack([e[2] for e in enc]))
             batch["num_solutions"] = [len(sols) for _, sols in chunk]

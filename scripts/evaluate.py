@@ -32,6 +32,8 @@ def main():
     device = pick_device(cfg.device)
     task = build_task_from_config(cfg)
     model, _ = load_model_from_checkpoint(args.checkpoint, device, use_ema=not args.raw_weights)
+    if cfg.model.compile:
+        model.compile_core()
     sample_cfg = resolve_sample_config(task, cfg)
     metrics = run_evaluation(model, task, cfg, device, sample_cfg)
     if args.analysis:

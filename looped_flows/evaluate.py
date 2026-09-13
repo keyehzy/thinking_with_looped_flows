@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from .data.common import Task, batch_to
-from .flow import SampleConfig, sample, sample_best_q
+from .flow import SampleConfig, sample, sample_best_q, sample_repeated
 from .losses import sequence_correct
 from .model import LoopedFlowDenoiser
 
@@ -19,7 +19,7 @@ def evaluate_exact_match(model: LoopedFlowDenoiser, task: Task, cfg: SampleConfi
     total = 0
     for batch in task.test_batches(batch_size, limit):
         b = batch_to(batch, device)
-        res = sample(model, b, cfg) if num_trajectories == 1 else sample_best_q(model, b, cfg, num_trajectories)
+        res = sample(model, b, cfg) if num_trajectories == 1 else sample_best_q(model, b, cfg, num_trajectories, max_batch=batch_size)
         ok = sequence_correct(res.tokens, b["labels"])
         correct += int(ok.sum())
         total += ok.numel()
@@ -30,12 +30,14 @@ def evaluate_exact_match(model: LoopedFlowDenoiser, task: Task, cfg: SampleConfi
 
 @torch.no_grad()
 def evaluate_multi_solution(model: LoopedFlowDenoiser, task: Task, cfg: SampleConfig, batch_size: int, device, num_samples: int = 20, limit: int | None = None, progress=None) -> dict:
+    """``batch_size`` counts sequences per sampler call; each problem is sampled ``num_samples`` times."""
     model.eval()
     agg: dict[str, list] = {}
     total = 0
-    for batch in task.test_batches(batch_size, limit):
+    problems_per_batch = max(1, batch_size // num_samples)
+    for batch in task.test_batches(problems_per_batch, limit):
         b = batch_to(batch, device)
-        samples = torch.stack([sample(model, b, cfg).tokens for _ in range(num_samples)], dim=1).cpu().numpy()
+        samples = sample_repeated(model, b, cfg, num_samples, max_batch=batch_size)[0].cpu().numpy()
         metrics = task.evaluate_samples(batch, samples)
         for k, v in metrics.items():
             agg.setdefault(k, []).extend(v)
