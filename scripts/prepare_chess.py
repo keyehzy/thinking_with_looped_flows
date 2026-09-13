@@ -198,9 +198,13 @@ def acceptable_from_pvs(pvs: list[tuple[chess.Move, int]], margin: int) -> tuple
 _engine = None
 
 
-def _engine_init(path: str, threads: int, hash_mb: int):
+def _engine_init(path: str, threads: int, hash_mb: int, timeout: float | None):
     global _engine
-    _engine = chess.engine.SimpleEngine.popen_uci(path)
+    # Modern Stockfish loads a ~100 MB NNUE network before answering "uciok", which routinely
+    # takes longer than python-chess' 10 s default -- 17 s here with the labelling pool already
+    # running, and the whole run then dies with TimeoutError. The same value bounds ``configure``;
+    # ``analyse`` is unbounded for depth / node limits, so this only covers startup.
+    _engine = chess.engine.SimpleEngine.popen_uci(path, timeout=timeout)
     _engine.configure({"Threads": threads, "Hash": hash_mb})
 
 
@@ -232,7 +236,7 @@ def cmd_stockfish(a):
     writer = Writer(a.out, a.test_fraction)
     jobs = ((fen, a.depth, a.nodes, a.multipv, a.margin) for fen in fens)
     n = 0
-    with Pool(a.workers, initializer=_engine_init, initargs=(a.engine, a.threads, a.hash)) as pool:
+    with Pool(a.workers, initializer=_engine_init, initargs=(a.engine, a.threads, a.hash, a.engine_timeout)) as pool:
         for res in tqdm(pool.imap_unordered(_engine_label, jobs, chunksize=8), unit="pos"):
             if res is None:
                 continue
@@ -339,6 +343,7 @@ def main():
     p.add_argument("--margin", type=int, default=30, help="centipawns within the best move that count as acceptable")
     p.add_argument("--threads", type=int, default=1, help="engine threads per worker")
     p.add_argument("--hash", type=int, default=64, help="engine hash (MB) per worker")
+    p.add_argument("--engine-timeout", type=float, default=120.0, help="seconds to allow for engine startup (NNUE load); 0 = wait forever")
     common(p)
 
     p = sub.add_parser("evaldb", help="convert lichess_db_eval.jsonl(.zst)")
@@ -349,6 +354,8 @@ def main():
     common(p)
 
     a = ap.parse_args()
+    if getattr(a, "engine_timeout", None) == 0:
+        a.engine_timeout = None
     {"puzzles": cmd_puzzles, "stockfish": cmd_stockfish, "evaldb": cmd_evaldb}[a.mode](a)
 
 
