@@ -33,6 +33,11 @@ def main():
     task = build_task_from_config(cfg)
     model, _ = load_model_from_checkpoint(args.checkpoint, device, use_ema=not args.raw_weights)
     sample_cfg = resolve_sample_config(task, cfg)
+    # The sampler draws its noise from the global generator, which is seeded from OS entropy at
+    # process start, so the same checkpoint scored twice gave different numbers. Pin it here (in
+    # the script, not in run_evaluation, so evaluating mid-training does not disturb the
+    # training RNG stream); pass train.seed=N to draw a different set of trajectories.
+    torch.manual_seed(cfg.train.seed)
     metrics = run_evaluation(model, task, cfg, device, sample_cfg)
     if args.analysis:
         metrics["analysis"] = convergence_analysis(model, task, sample_cfg, cfg.eval.batch_size, device, limit=cfg.eval.limit)
